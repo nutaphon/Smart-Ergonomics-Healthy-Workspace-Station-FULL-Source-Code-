@@ -1,0 +1,421 @@
+/*
+  Smart Ergonomics & Healthy Workspace Station (Adjusted Eye Alert & Delayed Stretch)
+  by Nuttaphon & Thitiporn (CE223_236C)
+*/
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <BH1750.h>
+#include <DHT.h>
+#include <Servo.h>
+
+// ---------------- Pins ----------------
+const uint8_t PIN_TRIG   = 9;
+const uint8_t PIN_ECHO   = 10;
+const uint8_t PIN_FSR    = A0;
+const uint8_t PIN_DHT    = 2;
+const uint8_t PIN_BTN    = 4;
+const uint8_t PIN_LED    = 3;
+const uint8_t PIN_BUZZER = 7;
+const uint8_t PIN_SERVO  = 6;
+
+// ---------------- Tunable values  ----------------
+const uint8_t  LCD_ADDR        = 0x27;   
+const int      FSR_THRESHOLD   = 3;    
+const int      CLOSE_CM        = 8;      
+const int      PRESENT_MAX_CM  = 11;     
+const unsigned long POSTURE_DELAY_MS = 10000;  
+const int      LUX_MIN         = 10;     
+const int      LUX_MAX         = 45;    
+
+// ---------------- Timing (เปลี่ยนตามโหมด) ----------------
+bool testMode = true;   
+unsigned long BREAK_MS, EYE_MS, SLEEP_MS, REST_MS, EYE_ALERT_MS;
+
+void applyTiming() {
+  if (testMode) {               
+    BREAK_MS     = 60000UL;     // 60 วินาที
+    EYE_MS       = 40000UL;     // เพิ่มเวลาให้ Look far นานขึ้น ไม่ถี่เกินไป
+    SLEEP_MS     = 15000UL;     // 15 วินาที 
+    REST_MS      = 30000UL;     // 30 วินาที 
+    EYE_ALERT_MS = 10000UL;     // ระยะเวลาแสดงหน้าจอ Look far
+  } else {
+    BREAK_MS     = 50UL * 60000UL; 
+    EYE_MS       = 20UL * 60000UL; 
+    SLEEP_MS     = 3UL * 60000UL;  
+    REST_MS      = 60000UL;        
+    EYE_ALERT_MS = 20000UL;
+  }
+}
+
+// ---------------- Objects ----------------
+LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
+BH1750 lightMeter;
+DHT dht(PIN_DHT, DHT11);   
+Servo curtainServo;
+
+// ---------------- State ----------------
+int   dist = 999;           
+int   fsrRaw = 0;
+float lux = 300;
+float temp = 0, hum = -1;
+bool  nearPerson = false, backPressed = false, present = false, sleeping = false;
+bool  breakMode = false, closeAlert = false, slouchAlert = false;
+bool  curtainOpen = false;
+bool  curtainEvent = false; 
+unsigned long curtainEventUntil = 0;
+
+// ตัวแปรควบคุมช่วงเวลายืดเส้น (Stretch State)
+unsigned long stretchStartAwayMs = 0; 
+bool  stretchingActive = false;
+unsigned long wellDoneUntil = 0;
+unsigned long eyeAlertEndTriggerTime = 0; // ตัวแปรเก็บเวลาสิ้นสุด Look far เพื่อเอาไว้หน่วงก่อนขึ้น Break
+
+unsigned long sitMs = 0, eyeMs = 0, awayMs = 0, closeMs = 0, slouchMs = 0;
+unsigned long eyeAlertUntil = 0, beepUntil = 0, msgUntil = 0;
+unsigned long lastLoop = 0, lastSensor = 0, lastDht = 0, lastLight = 0;
+unsigned long lastLcd = 0, lastScoreTick = 0, lastSerial = 0;
+unsigned long lastPostureBeep = 0, lastBreakBeep = 0;
+
+int  score = 100;
+uint8_t goodTicks = 0;
+int  ledLevel = 0;
+bool lastSleeping = false;
+bool lastBtn = HIGH;
+unsigned long lastBtnChange = 0;
+
+// ---------------- Helpers ----------------
+long readDistanceCm() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  long d = pulseIn(PIN_ECHO, HIGH, 25000UL);   
+  if (d == 0) return -1;
+  return (long)(d * 0.0343 / 2.0);
+}
+
+void beep(unsigned long ms) {
+  digitalWrite(PIN_BUZZER, HIGH);
+  beepUntil = millis() + ms;
+}
+
+void updateBuzzer(unsigned long now) {
+  if (beepUntil && (long)(now - beepUntil) >= 0) {
+    digitalWrite(PIN_BUZZER, LOW);
+    beepUntil = 0;
+  }
+}
+
+void lcdPrint(uint8_t row, const char *s) {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%-16s", s);
+  lcd.setCursor(0, row);
+  lcd.print(buf);
+}
+
+char grade() {
+  if (score >= 80) return 'A';
+  if (score >= 60) return 'B';
+  return 'C';
+}
+
+// ---------------- Button ----------------
+void handleButton(unsigned long now) {
+  bool r = digitalRead(PIN_BTN);
+  if (r != lastBtn && now - lastBtnChange > 50) {
+    lastBtnChange = now;
+    lastBtn = r;
+    if (r == LOW) {
+      testMode = !testMode;
+      applyTiming();
+      sitMs = eyeMs = awayMs = 0;
+      breakMode = false;
+      stretchingActive = false;
+      lcdPrint(0, testMode ? "TEST MODE: ON" : "TEST MODE: OFF");
+      lcdPrint(1, testMode ? "Fast timers" : "Real timers");
+      msgUntil = now + 1500;
+    }
+  }
+}
+
+// ---------------- Sensors ----------------
+void readSensors() {
+  long d = readDistanceCm();
+  dist = (d < 0) ? 999 : (int)d;
+  nearPerson = (dist <= PRESENT_MAX_CM);
+
+  fsrRaw = analogRead(PIN_FSR);
+  backPressed = (fsrRaw > FSR_THRESHOLD);
+
+  float l = lightMeter.readLightLevel();
+  if (l >= 0) lux = l;
+}
+
+void readDht(unsigned long now) {
+  if (now - lastDht < 2000) return;
+  lastDht = now;
+  float t = dht.readTemperature();
+  if (!isnan(t)) temp = t;
+}
+
+// ---------------- Logic ----------------
+void updateState(unsigned long dt, unsigned long now) {
+  present = nearPerson || backPressed;
+
+  if (present) {
+    awayMs = 0;
+    
+    if (breakMode && stretchingActive) {
+      breakMode = false;
+      stretchingActive = false;
+      sitMs = 0;
+      eyeMs = 0;
+    }
+
+    sitMs += dt;
+    eyeMs += dt;
+  } else {
+    awayMs += dt;
+
+    if (breakMode) {
+      if (!present) {
+        if (!stretchingActive) {
+          stretchingActive = true;
+          stretchStartAwayMs = now; 
+        } else {
+          if (now - stretchStartAwayMs >= 10000UL) {
+            breakMode = false;
+            stretchingActive = false;
+            sitMs = 0;
+            eyeMs = 0;
+            wellDoneUntil = now + 2000UL; 
+          }
+        }
+      }
+    } else {
+      stretchingActive = false;
+    }
+
+    if (awayMs >= REST_MS) {       
+      sitMs = 0;
+      eyeMs = 0;
+      breakMode = false;
+      stretchingActive = false;
+    }
+  }
+  
+  sleeping = (awayMs >= SLEEP_MS);
+
+  // Force break (Time to stretch) พร้อมเช็คเงื่อนไขหน่วงหลัง Look Far จบไปแล้วอย่างน้อย 10 วินาที
+  bool eyeAlertActive = ((long)(eyeAlertUntil - now) > 0);
+  if (!breakMode && sitMs >= BREAK_MS && !eyeAlertActive) {
+    // หน่วงเวลา 10 วินาทีหลังจาก Look far เพิ่งจบลง ก่อนจะยอมให้ Time to Stretch ขึ้น
+    if (now - eyeAlertEndTriggerTime >= 10000UL) {
+      breakMode = true;
+      stretchingActive = false;
+      lastBreakBeep = now - 5000UL;  
+    }
+  }
+
+  // กฎ 20-20-20
+  if (present && !breakMode && eyeMs >= EYE_MS) {
+    eyeMs = 0;
+    eyeAlertUntil = now + EYE_ALERT_MS;
+    eyeAlertEndTriggerTime = eyeAlertUntil; // บันทึกเวลาที่ Look far สิ้นสุด
+    beep(200);
+  }
+
+  bool tooClose = nearPerson && (dist < CLOSE_CM);
+  closeMs = tooClose ? closeMs + dt : 0;
+  closeAlert = (closeMs >= POSTURE_DELAY_MS);
+
+  bool slouch = nearPerson && !backPressed;
+  slouchMs = slouch ? slouchMs + dt : 0;
+  slouchAlert = (slouchMs >= POSTURE_DELAY_MS);
+
+  bool badPosture = closeAlert || slouchAlert;
+
+  if (badPosture && now - lastPostureBeep >= 3000UL) {
+    beep(150);
+    lastPostureBeep = now;
+  }
+  if (breakMode && !present && now - lastBreakBeep >= 5000UL) {
+    beep(800);
+    lastBreakBeep = now;
+  }
+
+  // Ergo score
+  if (now - lastScoreTick >= 2000UL) {
+    lastScoreTick = now;
+    if (present && badPosture) {
+      if (score > 0) score--;
+      goodTicks = 0;
+    } else if (present && score < 100) {
+      if (++goodTicks >= 5) {
+        score++;
+        goodTicks = 0;
+      }
+    }
+  }
+}
+
+// ---------------- Outputs ----------------
+void updateOutputs(unsigned long now) {
+  if (sleeping) {
+    ledLevel = 0;
+    analogWrite(PIN_LED, 0);
+  } else if ((long)(eyeAlertUntil - now) > 0) {
+    analogWrite(PIN_LED, ((now / 250) % 2) ? 255 : 0);   
+  } else if (now - lastLight >= 200UL) {
+    lastLight = now;
+    
+    bool prevCurtain = curtainOpen;
+    if (lux < LUX_MIN) {
+      curtainServo.write(90); 
+      curtainOpen = true;
+      ledLevel += 5;
+    } else if (lux > LUX_MAX) {
+      curtainServo.write(0);  
+      curtainOpen = false;
+      ledLevel -= 5;
+    }
+    
+    if (curtainOpen != prevCurtain) {
+      curtainEvent = true;
+      curtainEventUntil = now + 3000UL;
+    }
+
+    ledLevel = constrain(ledLevel, 0, 255);
+    analogWrite(PIN_LED, ledLevel);
+  }
+
+  if (sleeping != lastSleeping) {
+    if (sleeping) lcd.noBacklight(); else lcd.backlight();
+    lastSleeping = sleeping;
+  }
+}
+
+void updateLcd(unsigned long now) {
+  if (now < msgUntil || sleeping) return;
+  if (now - lastLcd < 1000UL) return;     
+  lastLcd = now;
+
+  char l1[20], l2[20];
+  int luxShow = (int)constrain(lux, 0, 9999);
+  int ti = (int)(temp * 10);
+
+  if ((long)(wellDoneUntil - now) > 0) {
+    lcdPrint(0, "Well Done!");
+    lcdPrint(1, "Back to Work");
+    return;
+  }
+
+  if (!breakMode && awayMs >= 3000UL) {
+    snprintf(l1, sizeof(l1), "Resting...");
+    snprintf(l2, sizeof(l2), "Away: %lus", awayMs / 1000UL);
+    lcdPrint(0, l1);
+    lcdPrint(1, l2);
+    return;
+  }
+
+  const char *alert = NULL;
+  if (closeAlert) {
+    alert = "Move Back!";
+  } else if (slouchAlert) {
+    alert = "Sit Up Straight!";
+  } else if ((long)(eyeAlertUntil - now) > 0) {
+    alert = "Look far 20s!";
+  } else if (breakMode) {
+    if (present) {
+      alert = "Time to Stretch!"; 
+    } else {
+      unsigned long elapsedStretch = now - stretchStartAwayMs;
+      int remainingStretchSec = (10000UL > elapsedStretch) ? (10000UL - elapsedStretch) / 1000UL : 0;
+      snprintf(l1, sizeof(l1), "Stretching...");
+      snprintf(l2, sizeof(l2), "Time left: %ds", remainingStretchSec);
+      lcdPrint(0, l1);
+      lcdPrint(1, l2);
+      return;
+    }
+  } else if (curtainEvent && (long)(curtainEventUntil - now) > 0) {
+    snprintf(l1, sizeof(l1), curtainOpen ? "Curtain: OPEN" : "Curtain: CLOSE");
+    snprintf(l2, sizeof(l2), "L: %d", luxShow);
+    lcdPrint(0, l1);
+    lcdPrint(1, l2);
+    return;
+  } else {
+    curtainEvent = false;
+  }
+
+  if (alert) {
+    snprintf(l1, sizeof(l1), "%s", alert);
+    snprintf(l2, sizeof(l2), "Score: %d (%c)", score, grade());
+    lcdPrint(0, l1);
+    lcdPrint(1, l2);
+  } else {
+    if (dist >= 999) snprintf(l1, sizeof(l1), "Dist: -- T:%d.%dC", ti / 10, abs(ti % 10));
+    else             snprintf(l1, sizeof(l1), "Dist:%dcm T:%d.%dC", dist, ti / 10, abs(ti % 10));
+    
+    snprintf(l2, sizeof(l2), "L:%d      S:%d", luxShow, score);
+    lcdPrint(0, l1);
+    lcdPrint(1, l2);
+  }
+}
+
+void debugSerial(unsigned long now) {
+  if (now - lastSerial < 1000UL) return;
+  lastSerial = now;
+  Serial.print("dist=");  Serial.print(dist);
+  Serial.print(" break="); Serial.print(breakMode);
+  Serial.print(" stretch="); Serial.println(stretchingActive);
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_BTN, INPUT_PULLUP);
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  Wire.begin();
+  lcd.init();
+  lcd.backlight();
+  lightMeter.begin();
+  dht.begin();
+  curtainServo.attach(PIN_SERVO);
+  curtainServo.write(0); 
+  curtainOpen = false;
+
+  applyTiming();
+
+  lcdPrint(0, "Smart Ergonomics");
+  lcdPrint(1, "Workspace Station");
+  delay(1500);
+  lcd.clear();
+
+  lastLoop = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+  unsigned long dt = now - lastLoop;
+  lastLoop = now;
+
+  handleButton(now);
+  updateBuzzer(now);
+
+  if (now - lastSensor >= 100UL) {
+    lastSensor = now;
+    readSensors();
+  }
+  readDht(now);
+
+  updateState(dt, now);
+  updateOutputs(now);
+  updateLcd(now);
+  debugSerial(now);
+}
